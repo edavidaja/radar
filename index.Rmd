@@ -1,0 +1,340 @@
+---
+output:
+  revealjs::revealjs_presentation:
+    css: assets/style.css
+---
+
+  ```{r global_options, include=FALSE}
+knitr::opts_chunk$set(
+  warning=FALSE, message=FALSE, echo=FALSE
+)
+options(scipen = 999)
+
+library(tidyverse)
+library(magrittr)
+library(lubridate)
+library(here)
+library(janitor)
+library(refinr)
+library(knitr)
+library(tsibble)
+library(fable)
+library(scales)
+library(highcharter)
+library(tidytext)
+library(ggrepel)
+library(glue)
+```
+
+```{r data, include=FALSE}
+fiscal_year <- function(date) {
+  if(is.character(date)) as.Date(date)
+
+  ifelse(month(date) >= 10, year(date) + 1, year(date))
+}
+
+fpds <- read_csv("raw/radars_extract.csv")
+
+fpds <-
+  fpds %>%
+  mutate(
+    fiscal_year = fiscal_year(action_date),
+    quarter = floor_date(action_date, unit = "quarter"),
+    ts_quarter = yearquarter(action_date),
+    month = floor_date(action_date, unit = "month")
+  )
+
+financials <- vars(
+  federal_action_obligation,
+  current_total_value_of_award,
+  base_and_exercised_options_value,
+  potential_total_value_of_award,
+  base_and_all_options_value
+)
+```
+
+# radar: a federal market overview {data-background=assets/sweep.gif}
+
+## agenda
+
+- market summary
+- key programs
+- additional data sources
+
+# market summary
+
+## market size
+
+```{r}
+
+market_size <- fpds %>%
+  distinct(award_id_piid, fiscal_year, .keep_all = TRUE) %>%
+  group_by(fiscal_year) %>%
+  summarise_at(
+    financials,
+    ~sum(., na.rm = TRUE)
+  )
+
+un_derscore <- function(df, var) {
+  var <- enquo(var)
+  update_var <- quo_name(var)
+
+  df %>%
+    mutate(!!update_var := str_replace_all(!!var, "_", " "))
+}
+
+p <- market_size %>% gather(key, value, -fiscal_year) %>%
+  mutate(value = round(value /1E9, 2)) %>%
+  un_derscore(key)
+
+hchart(p, "column", hcaes(fiscal_year, value, group = key))
+```
+
+## agencies
+
+```{r}
+agencies <- fpds %>%
+  distinct(fiscal_year, awarding_sub_agency_name, award_id_piid, .keep_all = TRUE) %>%
+  group_by(fiscal_year, awarding_sub_agency_name) %>%
+  summarise_at(
+    financials,
+    ~sum(., na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  arrange(fiscal_year, desc(current_total_value_of_award)) %>%
+  filter(current_total_value_of_award > 0) %>%
+  rename(`federal action obligation` = federal_action_obligation)
+
+hchart(agencies, "column", hcaes(fiscal_year, `federal action obligation`, group = awarding_sub_agency_name)) %>%
+  hc_xAxis(title = "federal action obligation")
+```
+
+## major vendors
+
+```{r}
+
+refine <- function(df, col) {
+  col <- enquo(col)
+  refined_col <- paste0("refined_", quo_name(col))
+
+  new_col <- df %>%
+    pull(!!col) %>%
+    refinr::key_collision_merge() %>%
+    refinr::n_gram_merge()
+
+  df %>%
+    mutate(
+      !!refined_col := new_col
+    )
+}
+
+awardees <- fpds %>%
+  mutate(
+    simple_recip_name = case_when(
+      str_detect(recipient_name, "L(-)?3") ~ "L-3",
+      str_detect(recipient_name, "GENERAL DYNAMICS") ~ "GENERAL DYNAMICS",
+      str_detect(recipient_name, "HONEYWELL") ~ "HONEYWELL",
+      str_detect(recipient_name, "LOCKHEED MARTIN") ~ "LOCKHEED MARTIN",
+      str_detect(recipient_name, "RAYTHEON") ~ "RAYTHEON",
+      str_detect(recipient_name, "ROCKWELL COLLINS") ~ "ROCKWELL COLLINS",
+      str_detect(recipient_name, "BOEING") ~ "BOEING",
+      str_detect(recipient_name, "BAE SYSTEMS") ~ "BAE SYSTEMS",
+      str_detect(recipient_name, "GE AVIATION") ~ "GE AVIATION",
+      str_detect(recipient_name, "NORTHROP GRUMMAN") ~ "NORTHROP GRUMMAN",
+      str_detect(recipient_name, "LEIDOS") ~ "LEIDOS",
+      TRUE ~ recipient_name
+    )
+  ) %>%
+  refine(simple_recip_name) %>%
+  group_by(fiscal_year, refined_simple_recip_name) %>%
+  summarise_at(financials, ~sum(., na.rm = TRUE)) %>%
+  ungroup()
+
+awards <- awardees %>%
+  group_by(fiscal_year) %>%
+  top_n(10, federal_action_obligation) %>%
+  group_by(refined_simple_recip_name, fiscal_year) %>%
+  mutate(total_obl = sum(federal_action_obligation)) %>%
+  ungroup() %>%
+  arrange(desc(total_obl)) %>%
+  rename(
+    awardee = refined_simple_recip_name,
+    `federal action obligation` = federal_action_obligation
+  )
+
+hchart(awards, "scatter", hcaes(awardee, `federal action obligation`, group=fiscal_year)) %>%
+  hc_chart(inverted = TRUE)
+```
+
+## quarterly psc breakdown
+
+```{r}
+psc <-
+  fpds %>%
+  group_by(product_or_service_code_description, quarter) %>%
+  summarise_at(financials, ~sum(., na.rm = TRUE)) %>%
+  rename(
+    `federal action obligation` = federal_action_obligation
+  )
+
+hchart(
+  psc,
+  "column",
+  hcaes(quarter, `federal action obligation`, group = product_or_service_code_description)
+)
+
+```
+
+## forecast
+
+```{r}
+
+quarterly_obligations <- fpds %>%
+  select(ts_quarter, product_or_service_code, federal_action_obligation) %>%
+  group_by(ts_quarter, product_or_service_code) %>%
+  summarise(obligations = sum(federal_action_obligation, na.rm = TRUE)) %>%
+  as_tsibble(key = id(product_or_service_code), index= ts_quarter)
+
+
+obs <- quarterly_obligations %>%
+  # fill_gaps(obligations = 0) %>%
+  # fill(obligations) %>%
+  model(
+    ets = ETS(log(obligations))
+  )
+
+obs %>%
+  forecast(h=8) %>%
+  autoplot(as_tsibble(quarterly_obligations)) +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::dollar) +
+  scale_x_yearweek() +
+  labs(x = "quarter")
+```
+
+# programs
+
+## key programs
+
+```{r}
+progs <-
+  fpds %>%
+  replace_na(list(dod_acquisition_program_description = "NONE")) %>%
+  mutate(
+    mdap = case_when(
+      dod_acquisition_program_description == "NONE" ~ "other",
+      TRUE ~ "mdap"
+    )
+  )
+
+# spend_by_prog <-
+mdap_scatter <- progs %>%
+  group_by(dod_acquisition_program_code) %>%
+  summarise(
+    program = first(dod_acquisition_program_description),
+    federal_action_obligation = sum(federal_action_obligation, na.rm = TRUE),
+  ) %>%
+  filter(federal_action_obligation != 0)
+
+mdap_scatter %>%
+  ggplot(aes(reorder(program, federal_action_obligation), federal_action_obligation)) +
+  geom_point(color = "#f4772a") + coord_flip() +
+  labs(x="") +
+  scale_y_continuous(labels = scales::dollar) +
+  theme_minimal()
+
+```
+
+```{r, results="asis", include=FALSE}
+non_mdap <- progs %>%
+  filter(dod_acquisition_program_description == "NONE") %>%
+  select(awarding_sub_agency_name, award_description, federal_action_obligation, base_and_exercised_options_value)
+
+custom_stopwords <- tibble(word = c("modification", "radar"))
+
+non_mdap_tidy <-
+  non_mdap %>%
+  unnest_tokens(word, award_description) %>%
+  anti_join(stop_words) %>%
+  anti_join(custom_stopwords)
+
+tfidf <- non_mdap_tidy %>%
+  group_by(awarding_sub_agency_name, word) %>%
+  summarize(
+    n = n(),
+    median_action_value = mean(base_and_exercised_options_value, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  bind_tf_idf(word, awarding_sub_agency_name, n )
+
+top_tf_idf <- tfidf %>%
+  group_by(awarding_sub_agency_name) %>%
+  top_n(50, tf_idf)
+
+word_value <- function(x) {
+  p <- top_tf_idf %>%
+    drop_na(word) %>%
+    filter(awarding_sub_agency_name == x) %>%
+    ggplot(aes(median_action_value, tf_idf, label = word)) +
+    geom_text_repel(
+      segment.alpha = 0,
+      aes(colour=median_action_value)
+    ) +
+    # scale_colour_viridis_c(option = "C") +
+    labs(
+      x = "Average contract value (by word)",
+      y = "Word importance"
+    ) +
+    theme_minimal() +
+    guides(color = "none") +
+    scale_x_continuous(labels = scales::dollar)
+
+  print(p)
+}
+```
+
+## "chatterplots:"
+
+- compare the importance of a word in its context with the average contract value of what the word describes
+
+## navy
+
+```{r}
+word_value("DEPT OF THE NAVY")
+```
+
+## army
+
+```{r}
+word_value("DEPT OF THE ARMY")
+```
+
+## air force
+
+```{r}
+word_value("DEPT OF THE AIR FORCE")
+```
+
+# additional data sources
+
+## DOD comptroller
+
+- budget requests for increases in programs with heavy radar component
+- [data](https://comptroller.defense.gov/Budget-Materials/)
+
+## new solicitations
+
+- program office solicitations for radar and related systems
+- [data](ftp://ftp.fbo.gov/)
+
+## selected acquisition reports
+
+- selected acquisition reports for major defense acquisition programs
+- [data](https://www.acq.osd.mil/ara/am/sar/)
+
+## commercial innvoations
+
+- commercial developments in sectors with possible spillover benefits
+- [IQT Portfolio](https://www.iqt.org/portfolio/)
+
+# questions? {data-background=assets/radar.gif}
